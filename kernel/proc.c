@@ -44,6 +44,7 @@ procinit(void)
   kvminithart();
 }
 
+
 // Must be called with interrupts disabled,
 // to prevent race with process being moved
 // to a different CPU.
@@ -121,6 +122,8 @@ found:
     return 0;
   }
 
+  p->kpagetable = ukvmcreate();
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -142,6 +145,9 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  if(p->kpagetable)
+    proc_freekpagetable(p->kpagetable, p->sz);
+  p->kpagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -195,6 +201,24 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmfree(pagetable, sz);
 }
 
+// Free a process's kernal page table, and free the
+// physical memory it refers to.
+void
+proc_freekpagetable(pagetable_t pagetable, uint64 sz)
+{
+  pagetable_t page = (pagetable_t) PTE2PA(pagetable[0]);
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = page[i];
+    if (page[i] & PTE_V) {
+      uint64 subpage =  PTE2PA(pte);
+      kfree((void *) subpage);
+      page[i] = 0;
+    }
+  }
+  kfree((void *) page);
+  kfree((void *) pagetable);
+}
+
 // a user program that calls exec("/init")
 // od -t xC initcode
 uchar initcode[] = {
@@ -230,6 +254,8 @@ userinit(void)
 
   p->state = RUNNABLE;
 
+  ukvmcopy(p->kpagetable, p->pagetable, p->sz, 0);
+
   release(&p->lock);
 }
 
@@ -249,6 +275,9 @@ growproc(int n)
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
+
+  ukvmcopy(p->kpagetable, p->pagetable, sz, p->sz);
+
   p->sz = sz;
   return 0;
 }
@@ -294,6 +323,8 @@ fork(void)
   pid = np->pid;
 
   np->state = RUNNABLE;
+
+  ukvmcopy(np->kpagetable, np->pagetable, np->sz, 0);
 
   release(&np->lock);
 
@@ -473,11 +504,17 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
+
+        kvminithart();
 
         found = 1;
       }
